@@ -2,7 +2,8 @@ name: Build Sely APK
 
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -10,96 +11,216 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    name: Build Sely Android APK
+    runs-on: ubuntu-24.04
 
     steps:
-      - name: Checkout repo
+
+      # =========================
+      # 1. Checkout repository
+      # =========================
+      - name: Checkout Sely repository
         uses: actions/checkout@v4
 
-      # ---- Locate the project (works whether you uploaded a .zip or the raw files) ----
-      - name: Extract project zip (if present) / locate project
-        run: |
-          ZIP_FILE=$(find . -maxdepth 1 -iname "*.zip" | head -n 1)
-          if [ -n "$ZIP_FILE" ]; then
-            echo "Found zip: $ZIP_FILE — extracting"
-            unzip -o "$ZIP_FILE" -d extracted
-            PROJECT_DIR=$(find extracted -maxdepth 4 -name "settings.gradle" -exec dirname {} \; | head -n 1)
-          else
-            echo "No zip found — looking for settings.gradle directly in the repo"
-            PROJECT_DIR=$(find . -maxdepth 3 -name "settings.gradle" -not -path "*/extracted/*" -exec dirname {} \; | head -n 1)
-          fi
-          if [ -z "$PROJECT_DIR" ]; then
-            echo "::error::Could not find settings.gradle anywhere in the repo."
-            exit 1
-          fi
-          echo "Using project at: $PROJECT_DIR"
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-
-      # ---- JDK 17 (required by AGP 8.2.0) ----
+      # =========================
+      # 2. Java 17
+      # =========================
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      # ---- Android SDK: installs sdkmanager, cmdline-tools, and licenses ----
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      # ---- Explicitly install the exact SDK pieces this project needs ----
-      - name: Install Android SDK packages
+      # =========================
+      # 3. Use GitHub's Android SDK
+      # =========================
+      - name: Configure Android SDK
+        shell: bash
         run: |
-          sdkmanager --install \
+          set -e
+
+          SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+
+          echo "Android SDK: $SDK_ROOT"
+
+          if [ ! -d "$SDK_ROOT" ]; then
+            echo "::error::Android SDK directory was not found."
+            exit 1
+          fi
+
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+
+          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+          echo "$SDK_ROOT/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+
+          SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER=$(find "$SDK_ROOT/cmdline-tools" \
+              -type f \
+              -name sdkmanager \
+              2>/dev/null | head -n 1)
+          fi
+
+          if [ -z "$SDKMANAGER" ]; then
+            echo "::error::sdkmanager was not found."
+            find "$SDK_ROOT" -maxdepth 4 -type f -name sdkmanager 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "Using sdkmanager: $SDKMANAGER"
+
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+
+          "$SDKMANAGER" \
             "platform-tools" \
             "platforms;android-34" \
             "build-tools;34.0.0"
 
-      # ---- Gradle itself (the project has no gradlew wrapper checked in) ----
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: 8.4
+          echo "Android SDK is ready."
 
-      - name: Make gradlew executable (if the project has one)
+      # =========================
+      # 4. Find Sely project
+      # =========================
+      - name: Locate Sely project
+        shell: bash
         run: |
-          if [ -f "${{ env.PROJECT_DIR }}/gradlew" ]; then
-            chmod +x "${{ env.PROJECT_DIR }}/gradlew"
+          set -e
+
+          if [ -f "settings.gradle" ] && [ -f "app/build.gradle" ]; then
+            echo "Sely project found in repository root."
+            echo "PROJECT_DIR=." >> "$GITHUB_ENV"
+            exit 0
           fi
 
-      # ---- Build ----
-      - name: Build debug APK
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: |
-          if [ -f "./gradlew" ]; then
-            ./gradlew assembleDebug --stacktrace
+          ZIP_FILE=""
+
+          if [ -f "SelyApp-updated.zip" ]; then
+            ZIP_FILE="SelyApp-updated.zip"
           else
-            gradle assembleDebug --stacktrace
+            ZIP_FILE=$(find . -maxdepth 1 -type f -iname "*.zip" | head -n 1)
           fi
 
-      # ---- Find the APK wherever Gradle put it ----
-      - name: Locate built APK
-        id: apk
-        run: |
-          APK_PATH=$(find "${{ env.PROJECT_DIR }}" -name "app-debug.apk" | head -n 1)
-          if [ -z "$APK_PATH" ]; then
-            echo "::error::No APK found after build."
+          if [ -z "$ZIP_FILE" ]; then
+            echo "::error::Sely Android project or ZIP was not found."
+            ls -lah
             exit 1
           fi
-          echo "Found APK: $APK_PATH"
-          echo "apk_path=$APK_PATH" >> "$GITHUB_OUTPUT"
 
-      # ---- Make it downloadable ----
-      - name: Upload APK as workflow artifact
+          echo "Found Sely ZIP: $ZIP_FILE"
+
+          rm -rf extracted
+          mkdir -p extracted
+
+          unzip -q -o "$ZIP_FILE" -d extracted
+
+          PROJECT_DIR=$(find extracted \
+            -type f \
+            -name "settings.gradle" \
+            -exec dirname {} \; | head -n 1)
+
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "::error::settings.gradle was not found."
+            find extracted -type f | sort
+            exit 1
+          fi
+
+          echo "Sely project located at: $PROJECT_DIR"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+      # =========================
+      # 5. Enable AndroidX
+      # =========================
+      - name: Configure AndroidX
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          touch gradle.properties
+
+          grep -qxF 'android.useAndroidX=true' gradle.properties || \
+            echo 'android.useAndroidX=true' >> gradle.properties
+
+          grep -qxF 'android.enableJetifier=true' gradle.properties || \
+            echo 'android.enableJetifier=true' >> gradle.properties
+
+          echo "AndroidX enabled."
+
+      # =========================
+      # 6. Gradle 8.4
+      # =========================
+      - name: Set up Gradle 8.4
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.4'
+
+      # =========================
+      # 7. Build Sely
+      # =========================
+      - name: Build Sely Debug APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -e
+
+          echo "======================================"
+          echo "BUILDING SELy ANDROID APK"
+          echo "======================================"
+
+          gradle assembleDebug \
+            --stacktrace \
+            --no-daemon
+
+      # =========================
+      # 8. Find APK
+      # =========================
+      - name: Verify Sely APK
+        shell: bash
+        run: |
+          set -e
+
+          APK=$(find "${PROJECT_DIR}" \
+            -type f \
+            -name "app-debug.apk" \
+            | head -n 1)
+
+          if [ -z "$APK" ]; then
+            echo "::error::Sely APK was not created."
+
+            echo "Searching for APK files:"
+            find "${PROJECT_DIR}" \
+              -type f \
+              -name "*.apk" \
+              -print || true
+
+            exit 1
+          fi
+
+          echo "======================================"
+          echo "SELy APK CREATED SUCCESSFULLY"
+          echo "======================================"
+          ls -lh "$APK"
+
+          echo "APK_PATH=$APK" >> "$GITHUB_ENV"
+
+      # =========================
+      # 9. Upload APK
+      # =========================
+      - name: Upload Sely APK
         uses: actions/upload-artifact@v4
         with:
-          name: sely-debug-apk
-          path: ${{ steps.apk.outputs.apk_path }}
+          name: Sely-Redesign-APK
+          path: ${{ env.APK_PATH }}
+          if-no-files-found: error
 
-      - name: Create GitHub Release with APK
+      # =========================
+      # 10. GitHub Release
+      # =========================
+      - name: Create Sely Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: build-${{ github.run_number }}
-          name: Sely build ${{ github.run_number }}
-          files: ${{ steps.apk.outputs.apk_path }}
+          tag_name: sely-redesign-${{ github.run_number }}
+          name: Sely Redesign Build ${{ github.run_number }}
+          files: ${{ env.APK_PATH }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
